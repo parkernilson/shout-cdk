@@ -1,6 +1,6 @@
 # shout-cdk
 
-Infrastructure as code (AWS CDK, TypeScript) for the backend of **UC Ward Announcements**, a simple SMS announcement service for the University City Ward (San Diego) of The Church of Jesus Christ of Latter-day Saints. People opt in by scanning a QR code on a printed poster, which opens their messaging app with **JOIN** (default channel **EQ**) or **JOIN <channel>** texted to the toll-free number. **LEAVE <channel>** leaves a channel, and **STOP** opts out of every channel. The channels are `ALL` (whole ward: announcements that apply to everyone), `EQ` (Elders Quorum), `RS` (Relief Society), `YM` (Young Men), `YW` (Young Women), `PR` (Primary), and `NR` (Nursery). Outgoing texts about a channel start with `UC Ward (<channel>):`; others start with `UC Ward:`.
+Infrastructure as code (AWS CDK, TypeScript) for the backend of **UC Ward Announcements**, a simple SMS announcement service for the University City Ward (San Diego) of The Church of Jesus Christ of Latter-day Saints. People opt in by scanning a QR code on a printed poster, which opens their messaging app with **JOIN** texted to the toll-free number, and opt out by replying **STOP**. There's a single subscriber list; there are no channels. Every outgoing text starts with `UC Ward:`.
 
 The repo, the website domain, and the existing SNS topic still use the old "Shout" name.
 
@@ -17,7 +17,7 @@ All resources live in account `445044180652`, region **`us-west-1`**.
 | 1 | Toll-free number (two-way SMS) | *existing*, registration pending | `+18444933651`<br>`arn:aws:sms-voice:us-west-1:445044180652:phone-number/phone-617c575d8efe4a21aa2a15f5222da64a` |
 | 2 | Incoming messages SNS topic | *existing* | `arn:aws:sns:us-west-1:445044180652:shout-replies` — the number's two-way SMS destination (keeps its pre-rebrand name) |
 | 3 | Reply-handler Lambda | planned | Subscribed to the `shout-replies` topic |
-| 4 | Channels + receivers DynamoDB tables | planned | Admin-created channels (keyed by keyword code, e.g. `EQ`), and who has joined each one |
+| 4 | Receivers DynamoDB table | planned | Every number that has texted JOIN, with its status |
 | 5 | Dashboard API + Cognito | planned | Cognito user pool (managed login) + API Gateway HTTP API with a JWT authorizer, in front of the dashboard Lambdas |
 
 ```
@@ -28,7 +28,7 @@ Incoming replies
 
 Dashboard
   Browser (GitHub Pages) ──► Cognito managed login (PKCE) ──► access token
-  Browser ──access token──► HTTP API (JWT authorizer) ──► Dashboard Lambdas ──► DynamoDB: channels, receivers
+  Browser ──access token──► HTTP API (JWT authorizer) ──► Dashboard Lambdas ──► DynamoDB: receivers
                                                                  │
                                                                  └──► announcements via the toll-free number
 ```
@@ -37,32 +37,28 @@ Dashboard
 
 Triggered by each message published to `shout-replies`. This is the only way a number gets into the system:
 
-- **`JOIN`** → subscribe the sender to the default channel **`EQ`** and reply with the join confirmation. **`JOIN <code>`** does the same for that channel. An unknown or archived code gets an "unknown channel" reply and nothing is written.
-- **`LEAVE <code>`** → unsubscribe the sender from that channel and confirm. A bare **`LEAVE`** leaves `EQ`.
-- **Anything else** → reply with the JOIN/LEAVE/STOP keywords and how to reach Parker Nilson (email: parker.todd.nilson@gmail.com).
+- **`JOIN`** → subscribe the sender and reply with the join confirmation.
+- **Anything else** → reply with the JOIN/STOP keywords and how to reach Parker Nilson (email: parker.todd.nilson@gmail.com).
 
 Notes:
 
-- On US toll-free numbers, **STOP** and **START**/**UNSTOP** are handled automatically by the carriers and can't be customized. The handler doesn't reply to them. STOP marks the number opted out in every channel it's subscribed to; START restores those channels.
-- A **HELP** response is configured on the number in AWS End User Messaging and must include the contact email and the JOIN/LEAVE/STOP keywords.
+- On US toll-free numbers, **STOP** and **START**/**UNSTOP** are handled automatically by the carriers and can't be customized. The handler doesn't reply to them.
+- **Let the carrier manage opt-outs.** With self-managed opt-outs off (the default; keep it off), STOP most likely never reaches `shout-replies`. AWS and the carrier block sends to opted-out numbers no matter what the table says. The table is updated when a send fails with the opted-out error, which marks the number `opted_out`, so the dashboard may show a number as subscribed until the next announcement after it texted STOP. If STOP/START do reach the handler, it marks the number opted out / resubscribes it.
+- A **HELP** response is configured on the number in AWS End User Messaging and must include the contact email and the JOIN/STOP keywords.
 - Keep records of when each number joined; they back the toll-free registration.
 
-### Channels and receivers tables
+### Receivers table
 
-Admins create, rename, and archive **channels** in the dashboard. Each channel has a short, immutable keyword **code** (uppercase letters/digits, e.g. `EQ`, `RS`) that people text after JOIN/LEAVE and that's printed on its posters, plus a display name. The initial channels `ALL`, `EQ`, `RS`, `YM`, `YW`, `PR`, `NR` (default `EQ`) are created by hand after the first deploy and must match `site.channels` on the website. A phone number can be in several channels.
+- **`receivers`** table with one item per phone number: partition key `phoneNumber` (E.164, e.g. `+15551234567`). Each item has a status (subscribed / opted out / removed) and timestamps for joining, opting out, and removal. No names are stored; a text only carries the phone number.
 
-- **`channels`** table, keyed on `code`, holding the display name and status (active / archived).
-- **`receivers`** table with one item per channel membership: partition key `channelCode`, sort key `phoneNumber` (E.164, e.g. `+15551234567`). Each item has a status (subscribed / left / opted out / removed) and timestamps for joining, leaving, opting out, and removal. A global secondary index `byPhone` (partition key `phoneNumber`) finds every channel a number belongs to, which STOP/START need. No names are stored; a text only carries the phone number.
-
-Only **subscribed** receivers get announcements. Opting out (STOP) applies to the whole number, so it marks every one of the number's subscribed memberships opted out.
+Only **subscribed** receivers get announcements.
 
 ### Dashboard API
 
 The dashboard is a page on the GitHub Pages site. It signs admins in with Cognito and calls Lambdas through an API Gateway HTTP API to:
 
-- **Manage channels**: create (code + name), rename, and archive them.
-- **List a channel's receivers** (phone number, status, join date) and **remove** them.
-- **Send an announcement** to every subscribed receiver in a channel. It goes out as `UC Ward (<channel>): <announcement>`, with STOP wording appended if missing.
+- **List receivers** (phone number, status, join date) and **remove** them.
+- **Send an announcement** to every subscribed receiver. It goes out as `UC Ward: <announcement>`, with STOP wording appended if missing.
 
 Admins **can't add numbers**: people only join by texting JOIN, which is the opt-in the posters and the toll-free registration describe.
 
